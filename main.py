@@ -3,12 +3,15 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from sessions import SessionManager
 from webhook_auth import verify_webhook_get, verify_webhook_signature
@@ -20,6 +23,12 @@ app = FastAPI(title="Texa Apparel WhatsApp Bot")
 
 # Session store (in-memory, 24h TTL).
 session_manager = SessionManager(ttl_seconds=24 * 60 * 60)
+
+# Serve photo assets on Render (so WhatsApp can fetch them via public URLs).
+PROJECT_DIR = Path(__file__).resolve().parent
+PHOTO_DIR = PROJECT_DIR / "photos"
+if PHOTO_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(PHOTO_DIR)), name="static")
 
 
 def _get_env(name: str) -> str:
@@ -35,6 +44,7 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()
 DESK_NOTIFY_WHATSAPP = os.getenv("DESK_NOTIFY_WHATSAPP", "").strip()
 APP_SECRET = os.getenv("APP_SECRET", "").strip() or None
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
 if VERIFY_TOKEN and ACCESS_TOKEN and PHONE_NUMBER_ID and DESK_NOTIFY_WHATSAPP:
     # Env is likely loaded and ready.
@@ -160,6 +170,17 @@ async def send_text(to_phone: str, text: str) -> None:
     await _send_whatsapp_payload(payload)
 
 
+async def send_image(to_phone: str, image_link: str, caption: str = "") -> None:
+    """Send an image message via WhatsApp Cloud API."""
+    payload: Dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "image",
+        "image": {"link": image_link, "caption": caption},
+    }
+    await _send_whatsapp_payload(payload)
+
+
 async def send_button_menu(to_phone: str, body_text: str, buttons: List[Tuple[str, str]]) -> None:
     """
     Send an interactive button message (max 3 buttons).
@@ -235,6 +256,32 @@ async def send_more_menu(to_phone: str) -> None:
         (BTN_MORE_CALLBACK, "Callback"),
     ]
     await send_button_menu(to_phone, body, buttons)
+
+
+def _public_photo_url(filename: str) -> str:
+    """
+    Build an absolute URL to the served static photo.
+
+    WhatsApp requires a publicly accessible URL for images.
+    """
+    base = (RENDER_EXTERNAL_URL or "").rstrip("/")
+    if not base:
+        raise RuntimeError("RENDER_EXTERNAL_URL is missing. Set it in Render env vars.")
+    # StaticFiles expects the filename segment as-is; we URL-encode it for safety.
+    return f"{base}/static/{quote(filename)}"
+
+
+def _list_catalogue_photos(max_photos: int = 3) -> List[str]:
+    """Return up to `max_photos` image filenames from the local `photos/` folder."""
+    if not PHOTO_DIR.exists():
+        return []
+    candidates: List[str] = []
+    for p in sorted(PHOTO_DIR.iterdir(), key=lambda x: x.name.lower()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() in {".jpeg", ".jpg", ".png", ".webp"}:
+            candidates.append(p.name)
+    return candidates[:max_photos]
 
 
 async def send_pricing_info(to_phone: str) -> None:
@@ -622,7 +669,23 @@ async def handle_button(from_phone: str, button_id: str) -> None:
         return
 
     if button_id == BTN_MORE_CATALOGUE:
-        await send_text(from_phone, "Catalogue on request ✅\nTell us your requirement (T-shirts / Uniforms / Event), and we will share the latest catalogue details.")
+        # Send a few public catalogue images (served from /static on Render).
+        await send_text(from_phone, "Texa Catalogue ✅ Here are some recent samples:")
+        try:
+            photo_files = _list_catalogue_photos(max_photos=3)
+            if not photo_files:
+                raise RuntimeError("No photos found in ./photos/")
+            for filename in photo_files:
+                link = _public_photo_url(filename)
+                await send_image(from_phone, link, caption=f"Texa — {filename}")
+        except Exception as e:
+            # If Render external URL isn't set, fall back to a text request.
+            await send_text(
+                from_phone,
+                "Catalogue on request ✅\n"
+                "Tell us your requirement (T-shirts / Uniforms / Event), and we will share the latest catalogue details.\n"
+                f"(Image sending not available: {type(e).__name__})",
+            )
         return
 
     if button_id == BTN_MORE_CONTACT:
